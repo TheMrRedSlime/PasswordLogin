@@ -45,7 +45,7 @@ subprojects {
 
     aliucord {
 
-        author("mantikafasi", 287555395151593473)
+        author("TheMrRedSlime", 1336334099857674353)
 
         updateUrl.set("https://raw.githubusercontent.com/mantikafasi/AliucordPlugins/builds/updater.json")
         buildUrl.set("https://raw.githubusercontent.com/mantikafasi/AliucordPlugins/builds/%s.zip")
@@ -73,6 +73,7 @@ subprojects {
 
         compileOnly("com.discord:discord:126021")
         compileOnly("com.aliucord:Aliucord:2.4.0")
+        compileOnly("androidx.lifecycle:lifecycle-process:2.6.2")
     }
 }
 

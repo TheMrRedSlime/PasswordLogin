@@ -9,6 +9,7 @@ import android.widget.TextView;
 import com.aliucord.Utils;
 import com.aliucord.api.SettingsAPI;
 import com.aliucord.widgets.BottomSheet;
+import com.discord.utilities.color.ColorCompat;
 import com.discord.views.CheckedSetting;
 import com.discord.views.RadioManager;
 import com.lytefast.flexinput.R;
@@ -31,7 +32,8 @@ public class PasswordLoginSettings extends BottomSheet {
         Context context = requireContext();
         setPadding(20);
 
-        CheckedSetting enabled = Utils.createCheckedSetting(context, CheckedSetting.ViewType.SWITCH, "Enable password login", "");
+        CheckedSetting enabled = Utils.createCheckedSetting(
+                context, CheckedSetting.ViewType.SWITCH, "Enable password login", "");
         enabled.setChecked(settings.getBool(PasswordLogin.ENABLED_KEY, true));
         enabled.setOnCheckedListener(value -> settings.setBool(PasswordLogin.ENABLED_KEY, value));
         addView(enabled);
@@ -39,7 +41,7 @@ public class PasswordLoginSettings extends BottomSheet {
         addLockDelayRadios(context);
 
         TextView setPassword = createActionRow(context, "Set PIN");
-        setPassword.setOnClickListener(v -> plugin.showSetPinDialog(com.aliucord.Utils.getAppActivity()));
+        setPassword.setOnClickListener(v -> plugin.showSetPinDialog(Utils.getAppActivity()));
         addView(setPassword);
 
         TextView lockNow = createActionRow(context, "Lock now");
@@ -47,21 +49,36 @@ public class PasswordLoginSettings extends BottomSheet {
         addView(lockNow);
     }
 
+    // FIX: theme-aware text colour instead of hardcoded white
     private TextView createActionRow(Context context, String text) {
         TextView row = new TextView(context, null, 0, R.i.UiKit_Settings_Item_Icon);
         row.setText(text);
-        row.setTextColor(Color.WHITE);
+        int colour;
+        try {
+            colour = ColorCompat.getThemedColor(context, R.b.colorTextNormal);
+        } catch (Throwable t) {
+            colour = Color.WHITE;
+        }
+        row.setTextColor(colour);
         return row;
     }
 
     private void addLockDelayRadios(Context context) {
         List<CheckedSetting> radios = Arrays.asList(
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO, "Show immediately", ""),
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO, "After 30 seconds inactive", ""),
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO, "After 1 minute inactive", ""),
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO, "After 5 minutes inactive", "")
+                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
+                        "Show immediately", ""),
+                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
+                        "After 5 seconds inactive", ""),
+                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
+                        "After 10 seconds inactive", ""),
+                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
+                        "After 30 seconds inactive", ""),
+                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
+                        "After 1 minute inactive", ""),
+                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
+                        "After 5 minutes inactive", "")
         );
-        List<Integer> values = Arrays.asList(0, 30_000, 60_000, 300_000);
+        List<Integer> values = Arrays.asList(0,5_000, 10_000, 30_000, 60_000, 300_000);
         RadioManager radioManager = new RadioManager(radios);
 
         int selectedIndex = values.indexOf(settings.getInt(PasswordLogin.LOCK_DELAY_KEY, 0));

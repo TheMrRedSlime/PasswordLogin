@@ -1,7 +1,7 @@
 
 [versions]
 aliucord = "main-SNAPSHOT"
-aliucord-gradle = "2.0.0"
+aliucord-gradle = "2.3.2"
 android = "8.13.0"
 discord = "126021"
 gradle = "ee747cc"

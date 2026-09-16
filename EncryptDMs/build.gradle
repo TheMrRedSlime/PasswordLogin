@@ -1,3 +1,0 @@
-version = "1.0.1"
-description = "Encrypts chats with exchanged public keys"
-aliucord.changelog.set("Implemented public key exchange, hybrid encryption, and automatic decrypt")
