@@ -30,7 +30,6 @@ import com.aliucord.utils.DimenUtils;
 import com.discord.utilities.color.ColorCompat;
 
 import java.security.SecureRandom;
-
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 
@@ -56,6 +55,7 @@ public class PasswordLogin extends Plugin {
     private boolean forceLock;
     private long lastStoppedAt = 0;
     private int startedActivities = 0;
+    private boolean isClearingPin = false;
 
     @Override
     public void start(Context context) throws Throwable {
@@ -64,7 +64,6 @@ public class PasswordLogin extends Plugin {
         settingsTab = new SettingsTab(PasswordLoginSettings.class, SettingsTab.Type.BOTTOM_SHEET)
                 .withArgs(settings, this);
 
-        // Load the last stopped time across process restarts/kills
         lastStoppedAt = authPrefs.getLong(LAST_STOPPED_AT_KEY, 0);
 
         lifecycleCallbacks = new Application.ActivityLifecycleCallbacks() {
@@ -72,12 +71,10 @@ public class PasswordLogin extends Plugin {
 
             @Override
             public void onActivityStarted(Activity activity) {
-                if (startedActivities == 0) {
-                    if (shouldLock()) {
-                        showLockDialog(activity);
-                    }
-                }
                 startedActivities++;
+                if (shouldLock()) {
+                    showLockDialog(activity);
+                }
             }
 
             @Override
@@ -97,7 +94,6 @@ public class PasswordLogin extends Plugin {
                     locked = true;
                     lastStoppedAt = System.currentTimeMillis();
                     
-                    // Persist the exit timestamp
                     if (authPrefs != null) {
                         authPrefs.edit().putLong(LAST_STOPPED_AT_KEY, lastStoppedAt).apply();
                     }
@@ -116,7 +112,6 @@ public class PasswordLogin extends Plugin {
         };
         application.registerActivityLifecycleCallbacks(lifecycleCallbacks);
 
-        // Immediate lock check on plugin start
         Activity currentActivity = com.aliucord.Utils.getAppActivity();
         if (currentActivity != null && shouldLock()) {
             showLockDialog(currentActivity);
@@ -134,9 +129,9 @@ public class PasswordLogin extends Plugin {
 
         if (lockDialog != null) {
             lockDialog.dismiss();
+            lockDialog = null;
         }
 
-        lockDialog = null;
         lifecycleCallbacks = null;
         authPrefs = null;
         application = null;
@@ -170,15 +165,16 @@ public class PasswordLogin extends Plugin {
     }
 
     private void showLockDialog(Activity activity) {
-        if (lockDialog != null && (!lockDialog.isShowing()
-                || lockDialog.getOwnerActivity() == null
-                || lockDialog.getOwnerActivity().isFinishing())) {
-            lockDialog = null;
+        if (activity == null || activity.isFinishing()) {
+            return;
         }
 
-        if (activity == null || activity.isFinishing()
-                || (lockDialog != null && lockDialog.isShowing())) {
-            return;
+        if (lockDialog != null) {
+            if (lockDialog.isShowing() && lockDialog.getOwnerActivity() == activity) {
+                return;
+            }
+            lockDialog.dismiss();
+            lockDialog = null;
         }
 
         int padding = DimenUtils.dpToPx(24);
@@ -215,7 +211,6 @@ public class PasswordLogin extends Plugin {
                 forceLock = false;
                 lastStoppedAt = 0;
                 
-                // Clear the saved stop timestamp on successful unlock
                 if (authPrefs != null) {
                     authPrefs.edit().remove(LAST_STOPPED_AT_KEY).apply();
                 }
@@ -243,11 +238,15 @@ public class PasswordLogin extends Plugin {
         lockDialog.setCancelable(false);
         lockDialog.setContentView(root);
         lockDialog.setOnShowListener(dialog -> {
-            if (lockDialog.getWindow() != null) {
+            if (lockDialog != null && lockDialog.getWindow() != null) {
                 lockDialog.getWindow().setSoftInputMode(
                         WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
             }
+            if (pinBoxesRef[0] != null && pinBoxesRef[0].length > 0) {
+                pinBoxesRef[0][0].requestFocus();
+            }
         });
+        
         lockDialog.show();
 
         if (lockDialog.getWindow() != null) {
@@ -409,47 +408,58 @@ public class PasswordLogin extends Plugin {
 
                 @Override
                 public void afterTextChanged(Editable editable) {
-                    if (editable.length() == 0) return;
+                    if (isClearingPin) return;
 
-                    if (index + 1 < boxes.length) {
-                        boxes[index + 1].requestFocus();
-                    }
+                    if (editable.length() == 1) {
+                        if (index + 1 < boxes.length) {
+                            boxes[index + 1].requestFocus();
+                        }
 
-                    String pin = collectPin(boxes);
-                    if (listener != null && pin.length() == boxes.length) {
-                        listener.onComplete(pin);
+                        String pin = collectPin(boxes);
+                        if (listener != null && pin.length() == boxes.length) {
+                            listener.onComplete(pin);
+                        }
                     }
                 }
             });
 
             box.setOnKeyListener((view, keyCode, event) -> {
-                if (keyCode == KeyEvent.KEYCODE_DEL
-                        && event.getAction() == KeyEvent.ACTION_DOWN
-                        && box.getText().length() == 0 && index > 0) {
-                    boxes[index - 1].requestFocus();
-                    boxes[index - 1].setText("");
-                    return true;
+                if (keyCode == KeyEvent.KEYCODE_DEL && event.getAction() == KeyEvent.ACTION_DOWN) {
+                    if (box.getText().length() == 0 && index > 0) {
+                        EditText prevBox = boxes[index - 1];
+                        prevBox.requestFocus();
+                        
+                        isClearingPin = true;
+                        prevBox.setText("");
+                        isClearingPin = false;
+                        return true;
+                    }
                 }
                 return false;
             });
         }
 
         parent.addView(row);
-        boxes[0].requestFocus();
+        boxes[0].post(() -> boxes[0].requestFocus());
         return boxes;
     }
 
     private void clearPinBoxes(EditText[] boxes) {
-        for (EditText box : boxes) {
-            box.setText("");
-        }
-        boxes[0].requestFocus();
+        if (boxes == null || boxes.length == 0) return;
+        boxes[0].post(() -> {
+            isClearingPin = true;
+            for (EditText box : boxes) {
+                if (box != null) box.setText("");
+            }
+            isClearingPin = false;
+            if (boxes[0] != null) boxes[0].requestFocus();
+        });
     }
 
     private String collectPin(EditText[] boxes) {
         StringBuilder pin = new StringBuilder();
         for (EditText box : boxes) {
-            if (box.getText().length() == 0) break;
+            if (box == null || box.getText().length() == 0) break;
             pin.append(box.getText());
         }
         return pin.toString();
