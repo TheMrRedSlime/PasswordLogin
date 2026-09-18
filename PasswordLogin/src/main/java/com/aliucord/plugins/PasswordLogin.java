@@ -91,11 +91,12 @@ public class PasswordLogin extends Plugin {
                 startedActivities--;
                 if (startedActivities <= 0) {
                     startedActivities = 0;
-                    locked = true;
-                    lastStoppedAt = System.currentTimeMillis();
-                    
-                    if (authPrefs != null) {
-                        authPrefs.edit().putLong(LAST_STOPPED_AT_KEY, lastStoppedAt).apply();
+                    if(!activity.isChangingConfigurations()) {
+                        locked = true;
+                        lastStoppedAt = System.currentTimeMillis();
+                        if (authPrefs != null) {
+                            authPrefs.edit().putLong(LAST_STOPPED_AT_KEY, lastStoppedAt).apply();
+                        }
                     }
                 }
             }
@@ -157,6 +158,10 @@ public class PasswordLogin extends Plugin {
 
         if (!locked) {
             return false;
+        }
+
+        if (lastStoppedAt == 0) {
+            return true;
         }
 
         int lockDelay = settings.getInt(LOCK_DELAY_KEY, 0);
@@ -234,6 +239,10 @@ public class PasswordLogin extends Plugin {
 
         lockDialog = new Dialog(activity);
         lockDialog.setOwnerActivity(activity);
+        if (lockDialog.getWindow() != null) {
+            lockDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+            lockDialog.getWindow().getAttributes().screenOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+        }
         lockDialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
         lockDialog.setCancelable(false);
         lockDialog.setContentView(root);
