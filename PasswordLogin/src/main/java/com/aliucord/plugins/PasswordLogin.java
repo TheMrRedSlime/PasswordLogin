@@ -19,6 +19,9 @@ import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputConnection;
+import android.view.inputmethod.InputConnectionWrapper;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -397,7 +400,27 @@ public class PasswordLogin extends Plugin {
 
         for (int i = 0; i < count; i++) {
             int index = i;
-            EditText box = new EditText(context);
+            EditText box = new EditText(context) {
+                @Override
+                public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
+                    InputConnection base = super.onCreateInputConnection(outAttrs);
+                    return new InputConnectionWrapper(base, true) {
+                        @Override
+                        public boolean deleteSurroundingText(int before, int after) {
+                            if (before == 1 && after == 0
+                                    && getText().length() == 0 && index > 0) {
+                                EditText prev = boxes[index - 1];
+                                prev.requestFocus();
+                                isClearingPin = true;
+                                prev.setText("");
+                                isClearingPin = false;
+                                return true;
+                            }
+                            return super.deleteSurroundingText(before, after);
+                        }
+                    };
+                }
+            };
             box.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
             box.setGravity(Gravity.CENTER);
             box.setSingleLine(true);
@@ -430,21 +453,6 @@ public class PasswordLogin extends Plugin {
                         }
                     }
                 }
-            });
-
-            box.setOnKeyListener((view, keyCode, event) -> {
-                if (keyCode == KeyEvent.KEYCODE_DEL && event.getAction() == KeyEvent.ACTION_DOWN) {
-                    if (box.getText().length() == 0 && index > 0) {
-                        EditText prevBox = boxes[index - 1];
-                        prevBox.requestFocus();
-                        
-                        isClearingPin = true;
-                        prevBox.setText("");
-                        isClearingPin = false;
-                        return true;
-                    }
-                }
-                return false;
             });
         }
 
