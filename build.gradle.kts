@@ -36,6 +36,7 @@ subprojects {
     apply(plugin = "com.aliucord.plugin")
 
     aliucord {
+        author("mantikafasi", 287555395151593473)
         author("TheMrRedSlime", 1336334099857674353)
         updateUrl.set("https://github.com/TheMrRedSlime/PasswordLogin/raw/refs/heads/main/build/outputs/updater.json")
         buildUrl.set("https://github.com/TheMrRedSlime/PasswordLogin/raw/refs/heads/main/build/outputs/%s.zip")
