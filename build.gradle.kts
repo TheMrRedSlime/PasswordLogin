@@ -37,8 +37,8 @@ subprojects {
 
     aliucord {
         author("TheMrRedSlime", 1336334099857674353)
-        updateUrl.set("https://raw.githubusercontent.com/TheMrRedSlime/AliucordPlugins/build/outputs/updater.json")
-        buildUrl.set("https://raw.githubusercontent.com/TheMrRedSlime/AliucordPlugins/build/outputs/%s.zip")
+        updateUrl.set("https://raw.githubusercontent.com/TheMrRedSlime/PasswordLogin/build/outputs/updater.json")
+        buildUrl.set("https://raw.githubusercontent.com/TheMrRedSlime/PasswordLogin/build/outputs/%s.zip")
     }
 
     android {
