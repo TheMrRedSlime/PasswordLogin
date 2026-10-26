@@ -2,5 +2,4 @@
 //include(":byebyeSlashCommands")
 include(":PasswordLogin")
 
-
 rootProject.name = "AliucordPlugins"

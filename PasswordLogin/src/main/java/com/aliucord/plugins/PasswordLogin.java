@@ -1,5 +1,6 @@
 package com.aliucord.plugins;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Application;
 import android.app.Dialog;
@@ -54,10 +55,11 @@ public class PasswordLogin extends Plugin {
     private SharedPreferences authPrefs;
     private Application.ActivityLifecycleCallbacks lifecycleCallbacks;
     private Dialog lockDialog;
+    private Activity lockDialogActivity;
     private boolean locked = true;
     private boolean forceLock;
     private long lastStoppedAt = 0;
-    private int startedActivities = 0;
+    private final java.util.Set<Activity> liveActivities = java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
     private boolean isClearingPin = false;
 
     @Override
@@ -74,7 +76,7 @@ public class PasswordLogin extends Plugin {
 
             @Override
             public void onActivityStarted(Activity activity) {
-                startedActivities++;
+                liveActivities.add(activity);
                 if (shouldLock()) {
                     showLockDialog(activity);
                 }
@@ -91,15 +93,12 @@ public class PasswordLogin extends Plugin {
 
             @Override
             public void onActivityStopped(Activity activity) {
-                startedActivities--;
-                if (startedActivities <= 0) {
-                    startedActivities = 0;
-                    if(!activity.isChangingConfigurations()) {
-                        locked = true;
-                        lastStoppedAt = System.currentTimeMillis();
-                        if (authPrefs != null) {
-                            authPrefs.edit().putLong(LAST_STOPPED_AT_KEY, lastStoppedAt).apply();
-                        }
+                liveActivities.remove(activity);
+                if (liveActivities.isEmpty() && !activity.isChangingConfigurations()) {
+                    locked = true;
+                    lastStoppedAt = System.currentTimeMillis();
+                    if (authPrefs != null) {
+                        authPrefs.edit().putLong(LAST_STOPPED_AT_KEY, lastStoppedAt).apply();
                     }
                 }
             }
@@ -108,17 +107,21 @@ public class PasswordLogin extends Plugin {
 
             @Override
             public void onActivityDestroyed(Activity a) {
-                if (lockDialog != null && lockDialog.getOwnerActivity() == a) {
-                    lockDialog.dismiss();
+                if (lockDialog != null && lockDialogActivity == a) {
+                    try { lockDialog.dismiss(); } catch (Throwable ignored) {}
                     lockDialog = null;
+                    lockDialogActivity = null;
                 }
             }
         };
         application.registerActivityLifecycleCallbacks(lifecycleCallbacks);
 
         Activity currentActivity = com.aliucord.Utils.getAppActivity();
-        if (currentActivity != null && shouldLock()) {
+        if (currentActivity != null) {
+            liveActivities.add(currentActivity);
+            if (shouldLock()) {
             showLockDialog(currentActivity);
+            }
         }
     }
 
@@ -134,19 +137,30 @@ public class PasswordLogin extends Plugin {
         if (lockDialog != null) {
             lockDialog.dismiss();
             lockDialog = null;
+            lockDialogActivity = null;
         }
 
         lifecycleCallbacks = null;
         authPrefs = null;
         application = null;
+
+        liveActivities.clear();
+        forceLock = false;
     }
 
     public void lockNow() {
         locked = true;
         forceLock = true;
+
         Activity activity = com.aliucord.Utils.getAppActivity();
+        if (activity == null && !liveActivities.isEmpty()) {
+            activity = liveActivities.iterator().next(); // any live one will do
+        }
+
         if (activity != null && shouldLock()) {
             showLockDialog(activity);
+        } else {
+            // No activity right now, the lifecycle callbacks will show the lock dialog on the next onActivityStarted/Resumed because forceLock is set.
         }
     }
 
@@ -178,11 +192,12 @@ public class PasswordLogin extends Plugin {
         }
 
         if (lockDialog != null) {
-            if (lockDialog.isShowing() && lockDialog.getOwnerActivity() == activity) {
+            if (lockDialog.isShowing() && lockDialogActivity == activity) {
                 return;
             }
-            lockDialog.dismiss();
+            try { lockDialog.dismiss(); } catch (Throwable ignored) {}
             lockDialog = null;
+            lockDialogActivity = null;
         }
 
         int padding = DimenUtils.dpToPx(24);
@@ -220,7 +235,7 @@ public class PasswordLogin extends Plugin {
                 lastStoppedAt = 0;
                 
                 if (authPrefs != null) {
-                    authPrefs.edit().remove(LAST_STOPPED_AT_KEY).apply();
+                    authPrefs.edit().remove(LAST_STOPPED_AT_KEY).commit();
                 }
 
                 if (lockDialog != null) {
@@ -242,6 +257,7 @@ public class PasswordLogin extends Plugin {
 
         lockDialog = new Dialog(activity);
         lockDialog.setOwnerActivity(activity);
+        lockDialogActivity = activity;
         if (lockDialog.getWindow() != null) {
             lockDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
             lockDialog.getWindow().getAttributes().screenOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
@@ -397,9 +413,11 @@ public class PasswordLogin extends Plugin {
         EditText[] boxes = new EditText[count];
         int size = DimenUtils.dpToPx(44);
         int margin = DimenUtils.dpToPx(4);
+        final Runnable[] pendingComplete = new Runnable[1];
 
         for (int i = 0; i < count; i++) {
             int index = i;
+            @SuppressLint("AppCompatCustomView")
             EditText box = new EditText(context) {
                 @Override
                 public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
@@ -411,9 +429,13 @@ public class PasswordLogin extends Plugin {
                                     && getText().length() == 0 && index > 0) {
                                 EditText prev = boxes[index - 1];
                                 prev.requestFocus();
+                                boolean prevClearing = isClearingPin;
                                 isClearingPin = true;
-                                prev.setText("");
-                                isClearingPin = false;
+                                try { 
+                                    prev.setText(""); 
+                                } finally { 
+                                    isClearingPin = prevClearing; 
+                                }
                                 return true;
                             }
                             return super.deleteSurroundingText(before, after);
@@ -442,15 +464,21 @@ public class PasswordLogin extends Plugin {
                 public void afterTextChanged(Editable editable) {
                     if (isClearingPin) return;
 
-                    if (editable.length() == 1) {
-                        if (index + 1 < boxes.length) {
-                            boxes[index + 1].requestFocus();
-                        }
+                    if (editable.length() == 1 && index + 1 < boxes.length) {
+                        boxes[index + 1].requestFocus();
+                    }
 
-                        String pin = collectPin(boxes);
-                        if (listener != null && pin.length() == boxes.length) {
-                            listener.onComplete(pin);
-                        }
+                    if (listener != null) {
+                        row.removeCallbacks(pendingComplete[0]);
+                        final int thisIndex = index;
+                        pendingComplete[0] = () -> {
+                            if (thisIndex != boxes.length - 1) return;
+                            String pin = collectPin(boxes);
+                            if (pin.length() == boxes.length) {
+                                listener.onComplete(pin);
+                            }
+                        };
+                        row.postDelayed(pendingComplete[0], 120);
                     }
                 }
             });
@@ -463,14 +491,17 @@ public class PasswordLogin extends Plugin {
 
     private void clearPinBoxes(EditText[] boxes) {
         if (boxes == null || boxes.length == 0) return;
-        boxes[0].post(() -> {
-            isClearingPin = true;
+        isClearingPin = true;
+        try {
             for (EditText box : boxes) {
                 if (box != null) box.setText("");
             }
+        } finally {
             isClearingPin = false;
-            if (boxes[0] != null) boxes[0].requestFocus();
-        });
+        }
+        if (boxes[0] != null) {
+            boxes[0].post(() -> boxes[0].requestFocus());
+        }
     }
 
     private String collectPin(EditText[] boxes) {
