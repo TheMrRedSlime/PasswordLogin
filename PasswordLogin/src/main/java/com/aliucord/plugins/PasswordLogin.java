@@ -1,106 +1,124 @@
 package com.aliucord.plugins;
 
-import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.Application;
 import android.app.Dialog;
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.os.Bundle;
-import android.text.Editable;
-import android.text.InputFilter;
-import android.text.InputType;
-import android.text.TextWatcher;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Base64;
 import android.view.Gravity;
-import android.view.KeyEvent;
+import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowManager;
 import android.widget.Button;
-import android.widget.EditText;
-import android.view.inputmethod.EditorInfo;
-import android.view.inputmethod.InputConnection;
-import android.view.inputmethod.InputConnectionWrapper;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import com.aliucord.Utils;
 import com.aliucord.annotations.AliucordPlugin;
 import com.aliucord.entities.Plugin;
 import com.aliucord.utils.DimenUtils;
 import com.discord.utilities.color.ColorCompat;
 
+import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.Collections;
+import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 
+/**
+ * PIN lock for Aliucord.
+ *
+ * Rewritten from scratch. Highlights vs. the old implementation:
+ *   - State for the lock dialog and the set-PIN dialog is fully separated.
+ *   - PIN entry lives in {@link PinEntryView} (reused by both dialogs).
+ *   - PBKDF2 hashing / verification runs off the main thread.
+ *   - Lock lifecycle is derived from a small, explicit state machine
+ *     (`locked`, `lockRequested`, `lastStoppedAt`) instead of ad-hoc flags.
+ *   - Set-PIN uses a confirm step so a typo can't lock you out.
+ *   - Theme colours are read defensively; boxes scale down for 6-digit PINs.
+ */
 @AliucordPlugin
 @SuppressWarnings("unused")
 public class PasswordLogin extends Plugin {
-    public static final String ENABLED_KEY = "enabled";
+
+    public static final String ENABLED_KEY    = "enabled";
     public static final String LOCK_DELAY_KEY = "lockDelayMs";
 
-    private static final String AUTH_PREFS = "PasswordLoginAuth";
-    private static final String PASSWORD_HASH_KEY = "passwordHash";
-    private static final String PASSWORD_SALT_KEY = "passwordSalt";
-    private static final String PIN_LENGTH_KEY = "pinLength";
-    private static final String PASSWORD_SCHEME_KEY = "passwordScheme";
-    private static final String LAST_STOPPED_AT_KEY = "lastStoppedAt";
-    private static final String SCHEME_PBKDF2 = "pbkdf2-sha256-v1";
+    private static final String PIN_HASH   = "pinHash";
+    private static final String PIN_SALT   = "pinSalt";
+    private static final String PIN_LENGTH = "pinLength";
+    private static final String PIN_SCHEME = "pinScheme";
+    private static final String PIN_SCHEME_VALUE = "pbkdf2-sha256-v1";
+    private static final int    PBKDF2_ITERATIONS = 150_000;
 
-    private Application application;
-    private SharedPreferences authPrefs;
-    private Application.ActivityLifecycleCallbacks lifecycleCallbacks;
+    private Application app;
+    private Application.ActivityLifecycleCallbacks lifecycle;
     private Dialog lockDialog;
-    private Activity lockDialogActivity;
-    private boolean locked = true;
-    private boolean forceLock;
-    private long lastStoppedAt = 0;
-    private final java.util.Set<Activity> liveActivities = java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
-    private boolean isClearingPin = false;
-    final boolean[] isDialogReady = {false};
+    private Activity lockDialogHost;
+
+    private final Set<Activity> liveActivities =
+            Collections.newSetFromMap(new WeakHashMap<>());
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private ExecutorService worker;
+    private volatile boolean alive = false;
+
+    /* ---- lock state ---- */
+    private boolean locked = true;          // must be unlocked before next visible frame
+    private boolean lockRequested = false;  // explicit "Lock now" – overrides enable toggle
+    private long lastStoppedAt = 0L;        // when the last activity stopped
+
+    // ------------------------------------------------------------------------------------
+    // Plugin lifecycle
+    // ------------------------------------------------------------------------------------
 
     @Override
     public void start(Context context) throws Throwable {
-        application = (Application) context.getApplicationContext();
-        authPrefs = application.getSharedPreferences(AUTH_PREFS, Context.MODE_PRIVATE);
+        app = (Application) context.getApplicationContext();
+        alive = true;
+        worker = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "PasswordLogin-Worker");
+            t.setDaemon(true);
+            return t;
+        });
+
         settingsTab = new SettingsTab(PasswordLoginSettings.class, SettingsTab.Type.BOTTOM_SHEET)
                 .withArgs(settings, this);
 
-        lastStoppedAt = authPrefs.getLong(LAST_STOPPED_AT_KEY, 0);
-
-        lifecycleCallbacks = new Application.ActivityLifecycleCallbacks() {
+        lifecycle = new Application.ActivityLifecycleCallbacks() {
             @Override public void onActivityCreated(Activity a, Bundle b) {}
 
             @Override
-            public void onActivityStarted(Activity activity) {
-                liveActivities.add(activity);
-                if (shouldLock()) {
-                    showLockDialog(activity);
-                }
+            public void onActivityStarted(Activity a) {
+                liveActivities.add(a);
             }
 
             @Override
-            public void onActivityResumed(Activity activity) {
-                if (shouldLock()) {
-                    showLockDialog(activity);
-                }
+            public void onActivityResumed(Activity a) {
+                if (shouldShowLock()) showLockDialog(a);
             }
 
             @Override public void onActivityPaused(Activity a) {}
 
             @Override
-            public void onActivityStopped(Activity activity) {
-                liveActivities.remove(activity);
-                if (liveActivities.isEmpty() && !activity.isChangingConfigurations()) {
+            public void onActivityStopped(Activity a) {
+                liveActivities.remove(a);
+                if (liveActivities.isEmpty() && !a.isChangingConfigurations()) {
                     locked = true;
                     lastStoppedAt = System.currentTimeMillis();
-                    if (authPrefs != null) {
-                        authPrefs.edit().putLong(LAST_STOPPED_AT_KEY, lastStoppedAt).apply();
-                    }
                 }
             }
 
@@ -108,471 +126,425 @@ public class PasswordLogin extends Plugin {
 
             @Override
             public void onActivityDestroyed(Activity a) {
-                if (lockDialog != null && lockDialogActivity == a) {
-                    try { lockDialog.dismiss(); } catch (Throwable ignored) {}
-                    lockDialog = null;
-                    lockDialogActivity = null;
-                }
+                if (lockDialog != null && lockDialogHost == a) dismissLockDialog();
             }
         };
-        application.registerActivityLifecycleCallbacks(lifecycleCallbacks);
+        app.registerActivityLifecycleCallbacks(lifecycle);
 
-        Activity currentActivity = com.aliucord.Utils.getAppActivity();
-        if (currentActivity != null) {
-            liveActivities.add(currentActivity);
-            if (shouldLock()) {
-            showLockDialog(currentActivity);
-            }
+        Activity current = Utils.getAppActivity();
+        if (current != null) {
+            liveActivities.add(current);
+            if (shouldShowLock()) showLockDialog(current);
         }
     }
 
     @Override
     public void stop(Context context) throws Throwable {
-        patcher.unpatchAll();
-        commands.unregisterAll();
+        alive = false;
+        try { patcher.unpatchAll(); } catch (Throwable ignored) {}
+        try { commands.unregisterAll(); } catch (Throwable ignored) {}
 
-        if (application != null && lifecycleCallbacks != null) {
-            application.unregisterActivityLifecycleCallbacks(lifecycleCallbacks);
+        if (app != null && lifecycle != null) {
+            try { app.unregisterActivityLifecycleCallbacks(lifecycle); } catch (Throwable ignored) {}
         }
+        dismissLockDialog();
 
-        if (lockDialog != null) {
-            lockDialog.dismiss();
-            lockDialog = null;
-            lockDialogActivity = null;
+        if (worker != null) {
+            worker.shutdownNow();
+            worker = null;
         }
-
-        lifecycleCallbacks = null;
-        authPrefs = null;
-        application = null;
 
         liveActivities.clear();
-        forceLock = false;
-    }
-
-    public void lockNow() {
+        lifecycle = null;
+        app = null;
         locked = true;
-        forceLock = true;
-
-        Activity activity = com.aliucord.Utils.getAppActivity();
-        if (activity == null && !liveActivities.isEmpty()) {
-            activity = liveActivities.iterator().next(); // any live one will do
-        }
-
-        if (activity != null && shouldLock()) {
-            showLockDialog(activity);
-        } else {
-            // No activity right now, the lifecycle callbacks will show the lock dialog on the next onActivityStarted/Resumed because forceLock is set.
-        }
+        lockRequested = false;
+        lastStoppedAt = 0L;
     }
 
-    private boolean shouldLock() {
-        if (!settings.getBool(ENABLED_KEY, true) || !hasPassword()) {
-            return false;
-        }
+    // ------------------------------------------------------------------------------------
+    // Public API used by the settings tab
+    // ------------------------------------------------------------------------------------
 
-        if (forceLock) {
-            return true;
-        }
+    public boolean hasPin() {
+        return settings.exists(PIN_HASH)
+                && settings.exists(PIN_SALT)
+                && settings.exists(PIN_LENGTH)
+                && PIN_SCHEME_VALUE.equals(settings.getString(PIN_SCHEME, null));
+    }
 
-        if (!locked) {
-            return false;
-        }
+    public void clearPin() {
+        settings.remove(PIN_HASH);
+        settings.remove(PIN_SALT);
+        settings.remove(PIN_LENGTH);
+        settings.remove(PIN_SCHEME);
+        settings.setBool(ENABLED_KEY, false);
+        toast(Utils.getAppContext(), "PIN cleared");
+    }
 
-        if (lastStoppedAt == 0) {
-            return true;
+    /** Explicit "lock now" – ignores the enable toggle but still requires a PIN. */
+    public void lockNow() {
+        if (!hasPin()) {
+            toast(Utils.getAppContext(), "Set a PIN first");
+            return;
         }
+        locked = true;
+        lockRequested = true;
+        lastStoppedAt = System.currentTimeMillis();
 
-        int lockDelay = settings.getInt(LOCK_DELAY_KEY, 0);
-        return lockDelay <= 0
-                || (lastStoppedAt > 0 && System.currentTimeMillis() - lastStoppedAt >= lockDelay);
+        Activity a = Utils.getAppActivity();
+        if (a == null && !liveActivities.isEmpty()) a = liveActivities.iterator().next();
+        if (a != null && !a.isFinishing() && !a.isDestroyed()) showLockDialog(a);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Lock dialog
+    // ------------------------------------------------------------------------------------
+
+    private boolean shouldShowLock() {
+        if (!hasPin()) return false;
+        if (lockRequested) return true;
+        if (!settings.getBool(ENABLED_KEY, true)) return false;
+        if (!locked) return false;
+
+        int delay = settings.getInt(LOCK_DELAY_KEY, 0);
+        if (delay <= 0) return true;
+        return System.currentTimeMillis() - lastStoppedAt >= delay;
+    }
+
+    private int getPinLength() {
+        int n = settings.getInt(PIN_LENGTH, 4);
+        return Math.max(4, Math.min(6, n));
     }
 
     private void showLockDialog(Activity activity) {
-        if (activity == null || activity.isFinishing()) {
-            return;
-        }
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
         if (lockDialog != null && lockDialog.isShowing()) {
-            return;
+            if (lockDialogHost == activity) return;
+            dismissLockDialog();
         }
+        lockDialog = buildLockDialog(activity);
+        lockDialogHost = activity;
+        lockDialog.show();
+    }
 
+    private void dismissLockDialog() {
         if (lockDialog != null) {
-            if (lockDialog.isShowing() && lockDialogActivity == activity) {
-                return;
-            }
             try { lockDialog.dismiss(); } catch (Throwable ignored) {}
             lockDialog = null;
-            lockDialogActivity = null;
+            lockDialogHost = null;
         }
+    }
 
-        isDialogReady[0] = false;
-
-        int padding = DimenUtils.dpToPx(24);
-        int cardPadding = DimenUtils.dpToPx(20);
-        int textNormal = themedText(activity);
-        int textMuted = ColorCompat.getThemedColor(activity, com.lytefast.flexinput.R.b.colorTextMuted);
+    private Dialog buildLockDialog(Activity activity) {
+        int pad     = DimenUtils.dpToPx(16);
+        int cardPad = DimenUtils.dpToPx(20);
+        int text    = safeText(activity);
+        int muted   = safeMuted(activity);
 
         FrameLayout root = new FrameLayout(activity);
-        root.setBackgroundColor(ColorCompat.getThemedColor(activity,
-                com.lytefast.flexinput.R.b.colorBackgroundPrimary));
-        root.setPadding(padding, padding, padding, padding);
+        root.setBackgroundColor(safeBg(activity));
+        root.setPadding(pad, pad, pad, pad);
 
         LinearLayout card = new LinearLayout(activity, null, 0,
                 com.lytefast.flexinput.R.i.UiKit_Dialog_Container);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(cardPadding, cardPadding, cardPadding, cardPadding);
+        card.setPadding(cardPad, cardPad, cardPad, cardPad);
+        card.setGravity(Gravity.CENTER_HORIZONTAL);
 
         TextView title = new TextView(activity, null, 0,
                 com.lytefast.flexinput.R.i.UiKit_Settings_Item_Header);
         title.setText("Unlock Discord");
-        title.setTextColor(textNormal);
+        title.setTextColor(text);
         card.addView(title);
 
-        TextView description = new TextView(activity, null, 0,
+        TextView subtitle = new TextView(activity, null, 0,
                 com.lytefast.flexinput.R.i.UiKit_Settings_Item_Label);
-        description.setText("Enter your PIN to continue");
-        description.setTextColor(textMuted);
-        card.addView(description);
+        subtitle.setText("Enter your PIN to continue");
+        subtitle.setTextColor(muted);
+        card.addView(subtitle);
 
-        final EditText[][] pinBoxesRef = new EditText[1][];
-        pinBoxesRef[0] = addPinBoxes(activity, card, getPinLength(), pin -> {
-            if (checkPassword(pin)) {
-                locked = false;
-                forceLock = false;
-                lastStoppedAt = 0;
-                
-                if (authPrefs != null) {
-                    authPrefs.edit().remove(LAST_STOPPED_AT_KEY).commit();
-                }
+        PinEntryView pin = new PinEntryView(activity, getPinLength(), true);
+        card.addView(pin);
 
-                if (lockDialog != null) {
-                    lockDialog.dismiss();
-                    lockDialog = null;
-                }
-            } else {
-                Toast.makeText(activity, "Wrong PIN", Toast.LENGTH_SHORT).show();
-                clearPinBoxes(pinBoxesRef[0]);
+        ProgressBar progress = new ProgressBar(activity);
+        progress.setVisibility(View.GONE);
+        LinearLayout.LayoutParams pLp = new LinearLayout.LayoutParams(
+                DimenUtils.dpToPx(28), DimenUtils.dpToPx(28));
+        pLp.topMargin = DimenUtils.dpToPx(12);
+        card.addView(progress, pLp);
+
+        pin.setListener(new PinEntryView.Listener() {
+            @Override public void onPinChanged(String current) { /* not used */ }
+
+            @Override
+            public void onPinComplete(String value) {
+                pin.setEnabledState(false);
+                progress.setVisibility(View.VISIBLE);
+                verifyAsync(value, ok -> {
+                    if (ok) {
+                        locked = false;
+                        lockRequested = false;
+                        lastStoppedAt = 0L;
+                        dismissLockDialog();
+                    } else {
+                        progress.setVisibility(View.GONE);
+                        pin.setEnabledState(true);
+                        pin.clear();
+                        toast(activity, "Wrong PIN");
+                    }
+                });
             }
         });
 
-        root.setOnTouchListener((v, event) -> {
-            return !isDialogReady[0];
-        });
-
-        FrameLayout.LayoutParams cardParams = new FrameLayout.LayoutParams(
+        root.addView(card, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER
-        );
-        root.addView(card, cardParams);
+                Gravity.CENTER));
 
-        lockDialog = new Dialog(activity);
-        lockDialog.setOwnerActivity(activity);
-        lockDialogActivity = activity;
-        if (lockDialog.getWindow() != null) {
-            lockDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-            lockDialog.getWindow().getAttributes().screenOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+        Dialog d = new Dialog(activity);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        d.setCancelable(false);
+        d.setCanceledOnTouchOutside(false);
+        d.setContentView(root);
+
+        Window w = d.getWindow();
+        if (w != null) {
+            w.addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+            w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
         }
-        lockDialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
-        lockDialog.setCancelable(false);
-        lockDialog.setContentView(root);
-        lockDialog.setOnShowListener(dialog -> {
-            isDialogReady[0] = true;
+        d.setOnShowListener(x -> {
+            if (w != null) {
+                w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT);
+                w.setBackgroundDrawable(new ColorDrawable(safeBg(activity)));
+            }
+            pin.focusFirst();
         });
-        
-        lockDialog.show();
-
-        if (lockDialog.getWindow() != null) {
-            lockDialog.getWindow().setLayout(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-            lockDialog.getWindow().setBackgroundDrawable(new ColorDrawable(
-                    ColorCompat.getThemedColor(activity,
-                            com.lytefast.flexinput.R.b.colorBackgroundPrimary)));
-            lockDialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
-        }
+        return d;
     }
 
-    public boolean hasPassword() {
-        return authPrefs != null
-                && authPrefs.contains(PASSWORD_HASH_KEY)
-                && authPrefs.contains(PASSWORD_SALT_KEY)
-                && authPrefs.contains(PIN_LENGTH_KEY)
-                && SCHEME_PBKDF2.equals(authPrefs.getString(PASSWORD_SCHEME_KEY, null));
-    }
-
-    public void setPassword(String password) {
-        if (authPrefs == null) return;
-
-        if (password == null || password.isEmpty()) {
-            authPrefs.edit()
-                    .remove(PASSWORD_HASH_KEY)
-                    .remove(PASSWORD_SALT_KEY)
-                    .remove(PIN_LENGTH_KEY)
-                    .remove(PASSWORD_SCHEME_KEY)
-                    .remove(LAST_STOPPED_AT_KEY)
-                    .apply();
-            settings.setBool(ENABLED_KEY, false);
-            return;
-        }
-
-        if (password.length() < 4 || password.length() > 6 || !password.matches("\\d+")) {
-            Toast.makeText(com.aliucord.Utils.getAppContext(),
-                    "PIN must be 4 to 6 digits", Toast.LENGTH_SHORT).show();
-            return;
-        }
-
-        byte[] salt = new byte[16];
-        new SecureRandom().nextBytes(salt);
-        String encodedSalt = Base64.encodeToString(salt, Base64.NO_WRAP);
-        String encodedHash = hashPassword(password, encodedSalt);
-
-        authPrefs.edit()
-                .putString(PASSWORD_SALT_KEY, encodedSalt)
-                .putString(PASSWORD_HASH_KEY, encodedHash)
-                .putString(PASSWORD_SCHEME_KEY, SCHEME_PBKDF2)
-                .putInt(PIN_LENGTH_KEY, password.length())
-                .apply();
-        settings.setBool(ENABLED_KEY, true);
-    }
+    // ------------------------------------------------------------------------------------
+    // Set PIN dialog (enter → confirm → save)
+    // ------------------------------------------------------------------------------------
 
     public void showSetPinDialog(Activity activity) {
-        if (activity == null || activity.isFinishing()) return;
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
 
-        isDialogReady[0] = false;
-
-        int padding = DimenUtils.dpToPx(24);
-        int cardPadding = DimenUtils.dpToPx(20);
-        int textNormal = themedText(activity);
-        int textMuted = ColorCompat.getThemedColor(activity, com.lytefast.flexinput.R.b.colorTextMuted);
+        int pad     = DimenUtils.dpToPx(16);
+        int cardPad = DimenUtils.dpToPx(20);
+        int text    = safeText(activity);
+        int muted   = safeMuted(activity);
 
         FrameLayout root = new FrameLayout(activity);
-        root.setBackgroundColor(ColorCompat.getThemedColor(activity,
-                com.lytefast.flexinput.R.b.colorBackgroundPrimary));
-        root.setPadding(padding, padding, padding, padding);
+        root.setPadding(pad, pad, pad, pad);
 
         LinearLayout card = new LinearLayout(activity, null, 0,
                 com.lytefast.flexinput.R.i.UiKit_Dialog_Container);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(cardPadding, cardPadding, cardPadding, cardPadding);
+        card.setPadding(cardPad, cardPad, cardPad, cardPad);
+        card.setGravity(Gravity.CENTER_HORIZONTAL);
 
         TextView title = new TextView(activity, null, 0,
                 com.lytefast.flexinput.R.i.UiKit_Settings_Item_Header);
-        title.setText("Set PIN");
-        title.setTextColor(textNormal);
+        title.setTextColor(text);
         card.addView(title);
 
-        TextView description = new TextView(activity, null, 0,
+        TextView subtitle = new TextView(activity, null, 0,
                 com.lytefast.flexinput.R.i.UiKit_Settings_Item_Label);
-        description.setText("Enter 4 to 6 digits.");
-        description.setTextColor(textMuted);
-        card.addView(description);
+        subtitle.setTextColor(muted);
+        card.addView(subtitle);
 
-        EditText[] pinBoxes = addPinBoxes(activity, card, 6, null);
+        PinEntryView pin = new PinEntryView(activity, 6, false);
+        card.addView(pin);
 
-        Dialog dialog = new Dialog(activity);
-        Button save = new Button(activity);
-        save.setText("Save PIN");
-        save.setTextColor(textNormal);
-        save.setOnClickListener(view -> {
-            if (!isDialogReady[0]) return;
-            String pin = collectPin(pinBoxes);
-            if (pin.length() < 4 || pin.length() > 6) {
-                Toast.makeText(activity, "PIN must be 4 to 6 digits", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            setPassword(pin);
-            dialog.dismiss();
-        });
-        card.addView(save);
+        Button action = new Button(activity);
+        action.setTextColor(text);
+        LinearLayout.LayoutParams aLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        aLp.topMargin = DimenUtils.dpToPx(12);
+        card.addView(action, aLp);
 
-        root.setOnTouchListener((v, event) -> !isDialogReady[0]);
+        Button cancel = new Button(activity);
+        cancel.setText("Cancel");
+        cancel.setTextColor(muted);
+        card.addView(cancel, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        FrameLayout.LayoutParams cardParams = new FrameLayout.LayoutParams(
+        root.addView(card, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER
-        );
-        root.addView(card, cardParams);
+                Gravity.CENTER));
 
-        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
-        dialog.setContentView(root);
-        dialog.setOnShowListener(d -> {
-            isDialogReady[0] = true;
+        Dialog d = new Dialog(activity);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        d.setCancelable(true);
+        d.setContentView(root);
+
+        final String[]  first = {null};
+        final boolean[] busy  = {false};
+
+        Runnable refresh = () -> {
+            String cur = pin.getPin();
+            if (first[0] == null) {
+                title.setText("Set PIN");
+                subtitle.setText("Enter 4–6 digits");
+                action.setText("Next");
+                action.setEnabled(!busy[0] && cur.length() >= 4 && cur.length() <= 6);
+            } else {
+                title.setText("Confirm PIN");
+                subtitle.setText("Re-enter your PIN");
+                action.setText("Save");
+                action.setEnabled(!busy[0] && cur.length() == first[0].length());
+            }
+        };
+
+        pin.setListener(new PinEntryView.Listener() {
+            @Override public void onPinChanged(String current) { refresh.run(); }
+            @Override public void onPinComplete(String value) { /* autoSubmit is off */ }
         });
 
-        dialog.show();
-        if (dialog.getWindow() != null) {
-            dialog.getWindow().setLayout(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-            dialog.getWindow().setBackgroundDrawable(new ColorDrawable(
-                    ColorCompat.getThemedColor(activity,
-                            com.lytefast.flexinput.R.b.colorBackgroundPrimary)));
-            dialog.getWindow().setSoftInputMode(
-                    WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
-        }
-    }
+        action.setOnClickListener(v -> {
+            if (busy[0]) return;
+            String cur = pin.getPin();
 
-    private int getPinLength() {
-        return authPrefs == null ? 4 : authPrefs.getInt(PIN_LENGTH_KEY, 4);
-    }
-
-    private EditText[] addPinBoxes(Context context, LinearLayout parent, int count,
-                                   PinCompleteListener listener) {
-        final Activity act = context instanceof Activity ? (Activity) context : null;
-        LinearLayout row = new LinearLayout(context);
-        row.setGravity(Gravity.CENTER);
-        row.setPadding(0, DimenUtils.dpToPx(16), 0, 0);
-        int textNormal = themedText(context);
-        int textMuted = ColorCompat.getThemedColor(context,
-                com.lytefast.flexinput.R.b.colorTextMuted);
-
-        EditText[] boxes = new EditText[count];
-        int size = DimenUtils.dpToPx(44);
-        int margin = DimenUtils.dpToPx(4);
-        final Runnable[] pendingComplete = new Runnable[1];
-
-        for (int i = 0; i < count; i++) {
-            int index = i;
-            @SuppressLint("AppCompatCustomView")
-            EditText box = new EditText(context) {
-                @Override
-                public InputConnection onCreateInputConnection(EditorInfo outAttrs) {
-                    InputConnection base = super.onCreateInputConnection(outAttrs);
-                    return new InputConnectionWrapper(base, true) {
-                        @Override
-                        public boolean deleteSurroundingText(int before, int after) {
-                            if (before == 1 && after == 0
-                                    && getText().length() == 0 && index > 0) {
-                                EditText prev = boxes[index - 1];
-                                prev.requestFocus();
-                                boolean prevClearing = isClearingPin;
-                                isClearingPin = true;
-                                try { 
-                                    prev.setText(""); 
-                                } finally { 
-                                    isClearingPin = prevClearing; 
-                                }
-                                return true;
-                            }
-                            return super.deleteSurroundingText(before, after);
-                        }
-                    };
+            if (first[0] == null) {
+                if (cur.length() < 4 || cur.length() > 6) {
+                    toast(activity, "PIN must be 4–6 digits");
+                    return;
                 }
-            };
-            box.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
-            box.setGravity(Gravity.CENTER);
-            box.setSingleLine(true);
-            box.setFilters(new InputFilter[]{new InputFilter.LengthFilter(1)});
-            box.setTextSize(18f);
-            box.setTextColor(textNormal);
-            box.setHintTextColor(textMuted);
-
-            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(size, size);
-            params.setMargins(margin, 0, margin, 0);
-            row.addView(box, params);
-            boxes[i] = box;
-
-            box.addTextChangedListener(new TextWatcher() {
-                @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-                @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
-
-                @Override
-                public void afterTextChanged(Editable editable) {
-                    if ((isClearingPin) || (isDialogReady != null && !isDialogReady[0])) return;
-
-                    if (editable.length() == 1 && index + 1 < boxes.length) {
-                        boxes[index + 1].requestFocus();
-                    }
-
-                    if (listener != null) {
-                        row.removeCallbacks(pendingComplete[0]);
-                        final int thisIndex = index;
-                        pendingComplete[0] = () -> {
-                            if (act != null && (act.isFinishing() || act.isDestroyed())) return;
-                            if (thisIndex != boxes.length - 1) return;
-                            String pin = collectPin(boxes);
-                            if (pin.length() == boxes.length) {
-                                listener.onComplete(pin);
-                            }
-                        };
-                        row.postDelayed(pendingComplete[0], 120);
-                    }
+                first[0] = cur;
+                pin.clear();
+                refresh.run();
+            } else {
+                if (!cur.equals(first[0])) {
+                    toast(activity, "PINs don't match");
+                    first[0] = null;
+                    pin.clear();
+                    refresh.run();
+                    return;
                 }
-            });
-        }
-
-        parent.addView(row);
-        return boxes;
-    }
-
-    private void clearPinBoxes(EditText[] boxes) {
-        if (boxes == null || boxes.length == 0) return;
-        isClearingPin = true;
-        try {
-            for (EditText box : boxes) {
-                if (box != null) box.setText("");
+                busy[0] = true;
+                refresh.run();
+                savePinAsync(cur,
+                        () -> { toast(activity, "PIN saved"); d.dismiss(); },
+                        () -> { busy[0] = false; refresh.run(); toast(activity, "Failed to save PIN"); });
             }
-        } finally {
-            isClearingPin = false;
+        });
+
+        cancel.setOnClickListener(v -> d.dismiss());
+
+        refresh.run();
+
+        d.show();
+        Window w = d.getWindow();
+        if (w != null) {
+            w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            w.setBackgroundDrawable(new ColorDrawable(safeBg(activity)));
+            w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
         }
-        if (boxes[0] != null) {
-            boxes[0].post(() -> boxes[0].requestFocus());
+        pin.focusFirst();
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Crypto (always off the main thread)
+    // ------------------------------------------------------------------------------------
+
+    private interface BoolCallback { void onResult(boolean ok); }
+
+    private void verifyAsync(String pin, BoolCallback cb) {
+        if (worker == null) return;
+        worker.submit(() -> {
+            boolean ok = verifyPin(pin);
+            mainHandler.post(() -> {
+                if (alive) cb.onResult(ok);
+            });
+        });
+    }
+
+    private void savePinAsync(String pin, Runnable onSuccess, Runnable onFailure) {
+        if (worker == null) { onFailure.run(); return; }
+        worker.submit(() -> {
+            try {
+                byte[] saltBytes = new byte[16];
+                new SecureRandom().nextBytes(saltBytes);
+                String salt = Base64.encodeToString(saltBytes, Base64.NO_WRAP);
+                String hash = computeHash(pin, salt);
+                if (hash == null) throw new IllegalStateException("hash failed");
+
+                mainHandler.post(() -> {
+                    if (!alive) return;
+                    settings.setString(PIN_SALT,   salt);
+                    settings.setString(PIN_HASH,   hash);
+                    settings.setString(PIN_SCHEME, PIN_SCHEME_VALUE);
+                    settings.setInt   (PIN_LENGTH, pin.length());
+                    settings.setBool  (ENABLED_KEY, true);
+                    onSuccess.run();
+                });
+            } catch (Throwable t) {
+                logger.error("savePin failed", t);
+                mainHandler.post(() -> {
+                    if (alive) onFailure.run();
+                });
+            }
+        });
+    }
+
+    private boolean verifyPin(String pin) {
+        String salt     = settings.getString(PIN_SALT,   null);
+        String expected = settings.getString(PIN_HASH,   null);
+        String scheme   = settings.getString(PIN_SCHEME, null);
+        if (salt == null || expected == null || !PIN_SCHEME_VALUE.equals(scheme)) return false;
+
+        String actual = computeHash(pin, salt);
+        if (actual == null) return false;
+
+        try {
+            return MessageDigest.isEqual(
+                    Base64.decode(expected, Base64.NO_WRAP),
+                    Base64.decode(actual,   Base64.NO_WRAP));
+        } catch (Throwable t) {
+            return false;
         }
     }
 
-    private String collectPin(EditText[] boxes) {
-        StringBuilder pin = new StringBuilder();
-        for (EditText box : boxes) {
-            if (box == null || box.getText().length() == 0) break;
-            pin.append(box.getText());
-        }
-        return pin.toString();
-    }
-
-    private interface PinCompleteListener {
-        void onComplete(String pin);
-    }
-
-    private boolean checkPassword(String password) {
-        if (authPrefs == null || password == null) return false;
-
-        String salt = authPrefs.getString(PASSWORD_SALT_KEY, null);
-        String expectedHash = authPrefs.getString(PASSWORD_HASH_KEY, null);
-        if (salt == null || expectedHash == null) return false;
-
-        String actualHash = hashPassword(password, salt);
-        if (actualHash.length() != expectedHash.length()) return false;
-
-        int diff = 0;
-        for (int i = 0; i < expectedHash.length(); i++) {
-            diff |= expectedHash.charAt(i) ^ actualHash.charAt(i);
-        }
-        return diff == 0;
-    }
-
-    private String hashPassword(String password, String salt) {
+    private String computeHash(String pin, String saltB64) {
         try {
             PBEKeySpec spec = new PBEKeySpec(
-                    password.toCharArray(),
-                    Base64.decode(salt, Base64.NO_WRAP),
-                    120_000,
+                    pin.toCharArray(),
+                    Base64.decode(saltB64, Base64.NO_WRAP),
+                    PBKDF2_ITERATIONS,
                     256);
-            byte[] hash = SecretKeyFactory
-                    .getInstance("PBKDF2WithHmacSHA256")
+            byte[] bytes = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
                     .generateSecret(spec)
                     .getEncoded();
-            return Base64.encodeToString(hash, Base64.NO_WRAP);
-        } catch (Throwable e) {
-            logger.error("Failed to hash password", e);
-            return "";
+            return Base64.encodeToString(bytes, Base64.NO_WRAP);
+        } catch (Throwable t) {
+            logger.error("hash failed", t);
+            return null;
         }
     }
 
-    private int themedText(Context context) {
-        try {
-            return ColorCompat.getThemedColor(context,
-                    com.lytefast.flexinput.R.b.colorTextNormal);
-        } catch (Throwable t) {
-            return Color.WHITE;
-        }
+    // ------------------------------------------------------------------------------------
+    // Theme helpers
+    // ------------------------------------------------------------------------------------
+
+    private static void toast(Context c, String msg) {
+        try { Toast.makeText(c, msg, Toast.LENGTH_SHORT).show(); } catch (Throwable ignored) {}
+    }
+
+    private static int safeText(Context c) {
+        try { return ColorCompat.getThemedColor(c, com.lytefast.flexinput.R.b.colorTextNormal); }
+        catch (Throwable t) { return Color.WHITE; }
+    }
+
+    private static int safeMuted(Context c) {
+        try { return ColorCompat.getThemedColor(c, com.lytefast.flexinput.R.b.colorTextMuted); }
+        catch (Throwable t) { return Color.GRAY; }
+    }
+
+    private static int safeBg(Context c) {
+        try { return ColorCompat.getThemedColor(c, com.lytefast.flexinput.R.b.colorBackgroundPrimary); }
+        catch (Throwable t) { return Color.BLACK; }
     }
 }

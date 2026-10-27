@@ -1,7 +1,6 @@
 package com.aliucord.plugins;
 
 import android.content.Context;
-import android.graphics.Color;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.TextView;
@@ -18,6 +17,7 @@ import java.util.Arrays;
 import java.util.List;
 
 public class PasswordLoginSettings extends BottomSheet {
+
     private final SettingsAPI settings;
     private final PasswordLogin plugin;
 
@@ -29,72 +29,76 @@ public class PasswordLoginSettings extends BottomSheet {
     @Override
     public void onViewCreated(View view, Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
-        Context context = requireContext();
+        Context ctx = requireContext();
         setPadding(20);
 
         CheckedSetting enabled = Utils.createCheckedSetting(
-                context, CheckedSetting.ViewType.SWITCH, "Enable password login", "");
+                ctx, CheckedSetting.ViewType.SWITCH, "Enable password lock", "");
         enabled.setChecked(settings.getBool(PasswordLogin.ENABLED_KEY, true));
-        enabled.setOnCheckedListener(value -> settings.setBool(PasswordLogin.ENABLED_KEY, value));
+        enabled.setOnCheckedListener(v -> settings.setBool(PasswordLogin.ENABLED_KEY, v));
         addView(enabled);
 
-        addLockDelayRadios(context);
+        addHeader(ctx, "Lock delay");
+        addLockDelayRadios(ctx);
 
-        TextView setPassword = createActionRow(context, "Set PIN");
-        setPassword.setOnClickListener(v -> plugin.showSetPinDialog(Utils.getAppActivity()));
-        addView(setPassword);
+        addHeader(ctx, "PIN");
 
-        TextView lockNow = createActionRow(context, "Lock now");
+        TextView setPin = actionRow(ctx, plugin.hasPin() ? "Change PIN" : "Set PIN");
+        setPin.setOnClickListener(v -> plugin.showSetPinDialog(Utils.getAppActivity()));
+        addView(setPin);
+
+        if (plugin.hasPin()) {
+            TextView clearPin = actionRow(ctx, "Clear PIN");
+            clearPin.setOnClickListener(v -> plugin.clearPin());
+            addView(clearPin);
+        }
+
+        TextView lockNow = actionRow(ctx, "Lock now");
         lockNow.setOnClickListener(v -> plugin.lockNow());
         addView(lockNow);
     }
 
-    // FIX: theme-aware text colour instead of hardcoded white
-    private TextView createActionRow(Context context, String text) {
-        TextView row = new TextView(context, null, 0, R.i.UiKit_Settings_Item_Icon);
+    private void addHeader(Context ctx, String text) {
+        TextView header = new TextView(ctx, null, 0, R.i.UiKit_Settings_Item_Header);
+        header.setText(text);
+        addView(header);
+    }
+
+    private TextView actionRow(Context ctx, String text) {
+        TextView row = new TextView(ctx, null, 0, R.i.UiKit_Settings_Item_Icon);
         row.setText(text);
-        int colour;
         try {
-            colour = ColorCompat.getThemedColor(context, R.b.colorTextNormal);
+            row.setTextColor(ColorCompat.getThemedColor(ctx, R.b.colorTextNormal));
         } catch (Throwable t) {
-            colour = Color.WHITE;
+            row.setTextColor(0xFFFFFFFF);
         }
-        row.setTextColor(colour);
         return row;
     }
 
-    private void addLockDelayRadios(Context context) {
+    private void addLockDelayRadios(Context ctx) {
         List<CheckedSetting> radios = Arrays.asList(
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
-                        "Show immediately", ""),
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
-                        "After 5 seconds inactive", ""),
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
-                        "After 10 seconds inactive", ""),
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
-                        "After 30 seconds inactive", ""),
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
-                        "After 1 minute inactive", ""),
-                Utils.createCheckedSetting(context, CheckedSetting.ViewType.RADIO,
-                        "After 5 minutes inactive", "")
+                Utils.createCheckedSetting(ctx, CheckedSetting.ViewType.RADIO, "Immediately", ""),
+                Utils.createCheckedSetting(ctx, CheckedSetting.ViewType.RADIO, "After 5 seconds", ""),
+                Utils.createCheckedSetting(ctx, CheckedSetting.ViewType.RADIO, "After 10 seconds", ""),
+                Utils.createCheckedSetting(ctx, CheckedSetting.ViewType.RADIO, "After 30 seconds", ""),
+                Utils.createCheckedSetting(ctx, CheckedSetting.ViewType.RADIO, "After 1 minute", ""),
+                Utils.createCheckedSetting(ctx, CheckedSetting.ViewType.RADIO, "After 5 minutes", "")
         );
-        List<Integer> values = Arrays.asList(0,5_000, 10_000, 30_000, 60_000, 300_000);
-        RadioManager radioManager = new RadioManager(radios);
+        List<Integer> values = Arrays.asList(0, 5_000, 10_000, 30_000, 60_000, 300_000);
+        RadioManager mgr = new RadioManager(radios);
 
-        int selectedIndex = values.indexOf(settings.getInt(PasswordLogin.LOCK_DELAY_KEY, 0));
-        if (selectedIndex == -1)
-            selectedIndex = 0;
-
-        CheckedSetting selected = radios.get(selectedIndex);
+        int idx = values.indexOf(settings.getInt(PasswordLogin.LOCK_DELAY_KEY, 0));
+        if (idx < 0) idx = 0;
+        CheckedSetting selected = radios.get(idx);
         selected.setChecked(true);
-        radioManager.a(selected);
+        mgr.a(selected);
 
         for (int i = 0; i < radios.size(); i++) {
-            int index = i;
+            final int index = i;
             CheckedSetting radio = radios.get(i);
-            radio.e(view -> {
+            radio.e(v -> {
                 settings.setInt(PasswordLogin.LOCK_DELAY_KEY, values.get(index));
-                radioManager.a(radio);
+                mgr.a(radio);
             });
             addView(radio);
         }
