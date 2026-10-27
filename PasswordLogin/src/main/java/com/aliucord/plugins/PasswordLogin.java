@@ -406,6 +406,7 @@ public class PasswordLogin extends Plugin {
 
     private EditText[] addPinBoxes(Context context, LinearLayout parent, int count,
                                    PinCompleteListener listener) {
+        final Activity act = context instanceof Activity ? (Activity) context : null;
         LinearLayout row = new LinearLayout(context);
         row.setGravity(Gravity.CENTER);
         row.setPadding(0, DimenUtils.dpToPx(16), 0, 0);
@@ -475,7 +476,7 @@ public class PasswordLogin extends Plugin {
                         row.removeCallbacks(pendingComplete[0]);
                         final int thisIndex = index;
                         pendingComplete[0] = () -> {
-                            if (activity.isFinishing() || activity.isDestroyed()) return;
+                            if (act != null && (act.isFinishing() || act.isDestroyed())) return;
                             if (thisIndex != boxes.length - 1) return;
                             String pin = collectPin(boxes);
                             if (pin.length() == boxes.length) {

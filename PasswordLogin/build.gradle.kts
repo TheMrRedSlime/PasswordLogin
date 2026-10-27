@@ -1,4 +1,4 @@
-version = "1.2.2"
+version = "1.2.3"
 description = "Locks Discord behind a password when returning to the app"
 
 android {
