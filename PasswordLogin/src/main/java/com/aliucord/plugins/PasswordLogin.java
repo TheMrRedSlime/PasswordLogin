@@ -190,6 +190,9 @@ public class PasswordLogin extends Plugin {
         if (activity == null || activity.isFinishing()) {
             return;
         }
+        if (lockDialog != null && lockDialog.isShowing()) {
+        return;
+    }
 
         if (lockDialog != null) {
             if (lockDialog.isShowing() && lockDialogActivity == activity) {
@@ -472,6 +475,7 @@ public class PasswordLogin extends Plugin {
                         row.removeCallbacks(pendingComplete[0]);
                         final int thisIndex = index;
                         pendingComplete[0] = () -> {
+                            if (activity.isFinishing() || activity.isDestroyed()) return;
                             if (thisIndex != boxes.length - 1) return;
                             String pin = collectPin(boxes);
                             if (pin.length() == boxes.length) {
