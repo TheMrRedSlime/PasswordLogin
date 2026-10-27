@@ -61,6 +61,7 @@ public class PasswordLogin extends Plugin {
     private long lastStoppedAt = 0;
     private final java.util.Set<Activity> liveActivities = java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
     private boolean isClearingPin = false;
+    final boolean[] isDialogReady = {false};
 
     @Override
     public void start(Context context) throws Throwable {
@@ -203,6 +204,8 @@ public class PasswordLogin extends Plugin {
             lockDialogActivity = null;
         }
 
+        isDialogReady[0] = false;
+
         int padding = DimenUtils.dpToPx(24);
         int cardPadding = DimenUtils.dpToPx(20);
         int textNormal = themedText(activity);
@@ -251,6 +254,10 @@ public class PasswordLogin extends Plugin {
             }
         });
 
+        root.setOnTouchListener((v, event) -> {
+            return !isDialogReady[0];
+        });
+
         FrameLayout.LayoutParams cardParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -269,13 +276,7 @@ public class PasswordLogin extends Plugin {
         lockDialog.setCancelable(false);
         lockDialog.setContentView(root);
         lockDialog.setOnShowListener(dialog -> {
-            if (lockDialog != null && lockDialog.getWindow() != null) {
-                lockDialog.getWindow().setSoftInputMode(
-                        WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
-            }
-            if (pinBoxesRef[0] != null && pinBoxesRef[0].length > 0) {
-                pinBoxesRef[0][0].requestFocus();
-            }
+            isDialogReady[0] = true;
         });
         
         lockDialog.show();
@@ -286,6 +287,7 @@ public class PasswordLogin extends Plugin {
             lockDialog.getWindow().setBackgroundDrawable(new ColorDrawable(
                     ColorCompat.getThemedColor(activity,
                             com.lytefast.flexinput.R.b.colorBackgroundPrimary)));
+            lockDialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
         }
     }
 
@@ -335,6 +337,8 @@ public class PasswordLogin extends Plugin {
     public void showSetPinDialog(Activity activity) {
         if (activity == null || activity.isFinishing()) return;
 
+        isDialogReady[0] = false;
+
         int padding = DimenUtils.dpToPx(24);
         int cardPadding = DimenUtils.dpToPx(20);
         int textNormal = themedText(activity);
@@ -369,6 +373,7 @@ public class PasswordLogin extends Plugin {
         save.setText("Save PIN");
         save.setTextColor(textNormal);
         save.setOnClickListener(view -> {
+            if (!isDialogReady[0]) return;
             String pin = collectPin(pinBoxes);
             if (pin.length() < 4 || pin.length() > 6) {
                 Toast.makeText(activity, "PIN must be 4 to 6 digits", Toast.LENGTH_SHORT).show();
@@ -379,6 +384,8 @@ public class PasswordLogin extends Plugin {
         });
         card.addView(save);
 
+        root.setOnTouchListener((v, event) -> !isDialogReady[0]);
+
         FrameLayout.LayoutParams cardParams = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -388,6 +395,10 @@ public class PasswordLogin extends Plugin {
 
         dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
         dialog.setContentView(root);
+        dialog.setOnShowListener(d -> {
+            isDialogReady[0] = true;
+        });
+
         dialog.show();
         if (dialog.getWindow() != null) {
             dialog.getWindow().setLayout(
@@ -466,7 +477,7 @@ public class PasswordLogin extends Plugin {
 
                 @Override
                 public void afterTextChanged(Editable editable) {
-                    if (isClearingPin) return;
+                    if ((isClearingPin) || (isDialogReady != null && !isDialogReady[0])) return;
 
                     if (editable.length() == 1 && index + 1 < boxes.length) {
                         boxes[index + 1].requestFocus();
@@ -490,7 +501,6 @@ public class PasswordLogin extends Plugin {
         }
 
         parent.addView(row);
-        boxes[0].post(() -> boxes[0].requestFocus());
         return boxes;
     }
 
