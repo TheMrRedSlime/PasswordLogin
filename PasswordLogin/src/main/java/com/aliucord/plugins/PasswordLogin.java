@@ -191,8 +191,8 @@ public class PasswordLogin extends Plugin {
             return;
         }
         if (lockDialog != null && lockDialog.isShowing()) {
-        return;
-    }
+            return;
+        }
 
         if (lockDialog != null) {
             if (lockDialog.isShowing() && lockDialogActivity == activity) {
